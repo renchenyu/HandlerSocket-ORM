@@ -1,0 +1,23 @@
+DEFAULT :
+    master : "localhost:3307"
+    slave :
+        - "localhost:3307"
+        - "localhost:3307"
+    user : "root"
+    password : "" 
+    hs_port : 9998
+    hs_port_w : 9999
+
+"Fo.*" :
+    -
+        master : "localhost:3306"
+        slave :
+            - "localhost:3306"
+            - "localhost:3306"
+        database : "hs1"
+    - 
+        master : "localhost:3306"
+        slave :
+            - "localhost:3306"
+            - "localhost:3306"
+        database : "hs2"

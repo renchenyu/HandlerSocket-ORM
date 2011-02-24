@@ -1,0 +1,123 @@
+0. 前言
+    关于HandlerSocket, 请Google
+
+1. 为每一张表建立映射
+
+例如有张表叫"foo"，那么建立一个package
+======================================================
+package MyApp::Test::Foo;
+use strict;
+use warnings;
+use base qw/Mixi::HS::Base/; #都需要继承Mixi::HS::Base
+
+__PACKAGE__->table_name('foo'); #接下来考虑可以自动根据package名得到表名
+
+1;
+======================================================
+
+2. 建立配置文件
+
+可以支持单master多slave的replication，以及sharding
+======================================================
+# db.yaml
+
+DEFAULT :
+    master : "172.31.224.1:3306" #port可以不写，默认是3306
+    slave : 
+        - "172.31.224.2:3306"
+        - "172.31.224.2:3307"  #slave可以有1到N台
+    user : "root" #可以不写，默认是root
+    password : "" #可以不写，默认是空
+    database : "main"
+    hs_port : 9998 #可以不写，默认是9998
+    hs_port_w : 9999 #可以不写，默认是9999
+
+"Test::.*" : #支持正则匹配
+    -                                 #shard 1
+        master : "172.31.224.3:3306"  #可以不写，如果没有则使用Default的，下同
+        slave :
+            - "172.31.224.4:3306" 
+            - "172.31.224.4:3307"
+        database : "test_01"
+    -                                 #shard 2
+        master : "172.31.224.5:3306"
+        slave :
+            - "172.31.224.6:3306"
+            - "172.31.224.6:3307"
+        database : "test_02"
+
+======================================================
+MyApp::Test::Foo，去掉MyApp后，可以匹配到"Test::.*"，如果匹配不到，则使用默认的DEFAULT
+
+3. 初始化
+
+可以根据配置自动载入表的信息（列，索引）
+======================================================
+Mixi::HS->init_file("MyApp", "path/db.yaml"); #会自动载入MyApp下所有的继承了Mixi::HS::Base的模块并初始化
+my $foo = Mixi::HS->load("Test::Foo");        #只需要去掉MyApp的部分
+======================================================
+init_file应该在一个进程的生命周期内只被调用一次。例如在psgi中在$app外面调用一次。
+
+4. 操作
+======================================================
+**** shard切换 ****
+my $shard_count = $foo->shard_count; #一共有几个shard
+$foo->switch_shard(0)  #切换到第一个shard，下标是从0开始的
+
+**** 通过HandlerSocket查询 ****
+#会根据表具体的索引自动生成方法(通过HandlerSocket)
+#比如一个表有4个列（id, name, age, created_at）
+#主建是id, 另外有一个索引是(name, age)
+
+#找到id是1的行, 如果找到对应的行，那么返回MyApp::Test::Foo的一个instance，如果没找到，那么返回undef
+$foo->find_by_pk([1]); 
+
+#其他索引的方法名规则是被索引的列通过"_"连接，如果没有符合条件的行，那么返回undef，如果只有一条，那么返回MyApp::Test::Foo的一个instance，如果有多行，那么返回由多个instance组成的array_ref
+$foo->find_by_name_age(["abc", 10], 1, 0);
+#第一个参数是与索引列相应的值，后续的参数（这里是10）是可选的。第2个参数是count，第3个是offset
+
+**** 通过HandlerSocket进行CRUD ****
+MyApp::Test::Foo的instance为表中每一列都自动生成了方法，比如
+my $a = $foo->find_by_pk([1]);
+my $name = $a->name;   #获取name
+$a->name("changed");   #修改name, 但是主键是不可以修改的
+my $b = $foo->new({ id => 222, name => "ren", age => 25, created_at => "2222-2-22 22:22:22" });  #也可以自己new出来
+
+$b->create  #创建一条记录（通过HandlerSocket），因为HandlerSocket直接与Engine对话，因此没有错误检查，比如你给int的字段传了个a，程序不会报错，Engine默认把a当0来处理。!!这种方法没办法获取auto_increment生成的主键
+$b->create_auto_inc #如果要获得auto_increment的主键，那么只能走这个SQL的方法。
+
+$a->update   #上面我把name修改了，更新到数据库中
+$a->delete   #在数据库中删除这条记录
+
+$a->to_hash  #转化成native的hash
+$a->inspect  #输出可读的instance内部信息，不要用Dumper了 :)
+
+**** SQL方法 ****
+HandlerSocket速度很快，但是有些时候我们还是得借助SQL的力量
+
+$foo->search($where, $order, $count, $offset) #参考SQL::Abstract的参数，返回是一个array_ref，其中包含0～N个$foo的instance
+
+#其他方法根据需要再添加
+
+**** 更RAW的方法 ****  
+!!!以下方法除非在不得不的情况下，请不要使用
+
+$foo->execute("master"|"slave", $stmt, $bind)
+$foo->select_all("master"|"slave", $stmt, $bind, $filter)
+$foo->select_row("master"|"slave", $stmt, $bind, $filter)
+$foo->select_one("master"|"slave", $stmt, $bind)
+======================================================
+
+5. 性能实测
+
+在我的笔记本上对比了一下hs_insert vs sql_insert, hs_pk vs sql_pk
+======================================================
+Benchmark: timing 10000 iterations of hs_insert, sql_insert...
+    hs_insert: 17 wallclock secs ( 0.92 usr +  0.26 sys =  1.18 CPU) @ 8474.58/s (n=10000)
+    sql_insert: 40 wallclock secs ( 6.67 usr +  0.49 sys =  7.16 CPU) @ 1396.65/s (n=10000)
+Benchmark: timing 10000 iterations of hs_pk, sql_pk...
+    hs_pk:  3 wallclock secs ( 0.62 usr +  0.11 sys =  0.73 CPU) @ 13698.63/s (n=10000)
+    sql_pk: 16 wallclock secs ( 4.13 usr +  0.23 sys =  4.36 CPU) @ 2293.58/s (n=10000)
+======================================================
+
+
