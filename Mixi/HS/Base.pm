@@ -2,13 +2,13 @@ package Mixi::HS::Base;
 use strict;
 use warnings;
 
-use base qw/Class::Accessor::Fast Class::Data::Inheritable/;
+use base qw/Class::Data::Inheritable/;
 
 use Data::Dumper;
 
 use DBI;
 use List::Util qw/first shuffle/;
-use List::MoreUtils qw/part all/;
+use List::MoreUtils qw/part all any/;
 use Net::HandlerSocket;
 use SQL::Abstract;
 use Scope::Session;
@@ -22,6 +22,7 @@ __PACKAGE__->mk_classdata('_hs');
 __PACKAGE__->mk_classdata('_hs_w');
 __PACKAGE__->mk_classdata('DEBUG');
 __PACKAGE__->mk_classdata('auto_increment');
+__PACKAGE__->mk_classdata('_pk_index_num');
 
 __PACKAGE__->mk_classdata('dbs');
 __PACKAGE__->mk_classdata('_shard_num');
@@ -39,6 +40,8 @@ use constant DEFAULT_HS_PORT_W => 9999;
 
 __PACKAGE__->_pnotes_enable(0);
 __PACKAGE__->_cache( {} );
+
+my $sql = SQL::Abstract->new;
 
 #FOR APACHE2
 if ( exists $ENV{MOD_PERL_API_VERSION} && $ENV{MOD_PERL_API_VERSION} == 2 ) {
@@ -62,7 +65,6 @@ sub init {
 
     $class->DEBUG($is_debug);
     $class->_load_schema_info;
-    $class->_create_accessors;
     $class->_init_read_handlersocket;
 
     return $class;
@@ -81,7 +83,7 @@ sub switch_shard {
 
 sub shard_count {
     my ($class) = @_;
-    return scalar @{$class->dbs};
+    return scalar @{ $class->dbs };
 }
 
 sub _get_master_db {
@@ -150,14 +152,6 @@ sub _set_hs_w {
     $class->_hs_w->[ $class->_shard_num ] = $hs_w;
 }
 
-sub _create_accessors {
-    my $class = shift;
-
-    my @parts = part { $class->_is_pk($_) } @{ $class->columns };
-    $class->mk_accessors( @{ $parts[0] }, '__from_db' );
-    $class->mk_ro_accessors( @{ $parts[1] } );
-}
-
 sub _load_schema_info {
     my $class = shift;
     $class->_load_columns unless defined $class->columns;
@@ -174,12 +168,80 @@ sub _init_write_handlersocket {
         }
     );
     $class->_set_hs_w($hs);
+    my $indexes = $class->indexes;
     my $columns = $class->columns;
-    my $err =
-      $hs->open_index( 0, $db->{database}, $class->table_name, 'PRIMARY',
-        join( ",", @$columns ) );
-    Mixi::HS::Exception->new( { error => $hs->get_error() } )->throw
-      if $err != 0;
+    my $i       = 0;
+    foreach my $key ( keys %$indexes ) {
+        my $err =
+          $hs->open_index( ++$i, $db->{database}, $class->table_name, $key,
+            join( ",", @$columns ) );
+        Mixi::HS::Exception->new( { error => $hs->get_error() } )->throw
+          if $err != 0;
+        $class->_pk_index_num($i) if $key eq 'PRIMARY';
+        my $func_name = "update_by_" . join( "_", @{ $indexes->{$key} } );
+        $class->_create_update_method( $func_name, $i )
+          unless $class->can($func_name);
+        $func_name = "delete_by_" . join( "_", @{ $indexes->{$key} } );
+        $class->_create_delete_method( $func_name, $i )
+          unless $class->can($func_name);
+    }
+}
+
+sub _create_update_method {
+    my ( $class, $func_name, $index_num ) = @_;
+
+    {
+        no strict 'refs';
+        my $method = "$class" . "::" . "$func_name";
+
+        print STDERR "generate method: $method\n" if $class->DEBUG;
+
+        *{$method} = sub {
+            my ( $class, $value, $where, $count, $offset, $op ) = @_;
+            print STDERR "$method invoked\n" if $class->DEBUG;
+
+            $count  ||= 1;
+            $offset ||= 0;
+            $op     ||= '=';
+            my $res = $class->_execute_single_wrapper(
+                'w',
+                sub {
+                    shift->execute_single( $index_num, $op, $where, $count,
+                        $offset, 'U',
+                        [ map { $value->{$_} } @{ $class->columns } ] );
+                }
+            );
+            return $res->[1];
+        };
+    }
+}
+
+sub _create_delete_method {
+    my ( $class, $func_name, $index_num ) = @_;
+
+    {
+        no strict 'refs';
+        my $method = "$class" . "::" . "$func_name";
+
+        print STDERR "generate method: $method\n" if $class->DEBUG;
+
+        *{$method} = sub {
+            my ( $class, $where, $count, $offset, $op ) = @_;
+            print STDERR "$method invoked\n" if $class->DEBUG;
+
+            $count  ||= 1;
+            $offset ||= 0;
+            $op     ||= '=';
+            my $res = $class->_execute_single_wrapper(
+                'w',
+                sub {
+                    shift->execute_single( $index_num, $op, $where, $count,
+                        $offset, 'D' );
+                }
+            );
+            return $res->[1];
+        };
+    }
 }
 
 sub _init_read_handlersocket {
@@ -201,10 +263,10 @@ sub _init_read_handlersocket {
             join( ",", @$columns ) );
         Mixi::HS::Exception->new( { error => $hs->get_error() } )->throw
           if $err != 0;
-        my $func_name = "find_by_"
-          . ( $key eq 'PRIMARY' ? "pk" : join "_", @{ $indexes->{$key} } );
+        my $func_name = "find_by_" . join( "_", @{ $indexes->{$key} } );
         print STDERR "func: $func_name\n" if $class->DEBUG;
-        $class->_create_find_method( $func_name, $i ) unless $class->can($func_name);
+        $class->_create_find_method( $func_name, $i )
+          unless $class->can($func_name);
     }
 }
 
@@ -218,14 +280,15 @@ sub _create_find_method {
         print STDERR "generate method: $method\n" if $class->DEBUG;
 
         *{$method} = sub {
-            my ( $class, $params, $count, $offset ) = @_;
+            my ( $class, $params, $count, $offset, $op ) = @_;
             print STDERR "$method invoked\n" if $class->DEBUG;
             $count  ||= 1;
             $offset ||= 0;
+            $op     ||= '=';
             my $res = $class->_execute_single_wrapper(
                 'r',
                 sub {
-                    shift->execute_single( $index_num, '=', $params, $count,
+                    shift->execute_single( $index_num, $op, $params, $count,
                         $offset );
                 }
             );
@@ -235,12 +298,12 @@ sub _create_find_method {
             my @result;
 
             for ( my $i = 0 ; $i < $rows ; ++$i ) {
-                my %obj = ( __from_db => 1 );
+                my %obj = ();
                 for ( my $j = 0 ; $j < scalar @$columns ; ++$j ) {
                     $obj{ $columns->[$j] } =
                       $res->[ $i * scalar(@$columns) + $j ];
                 }
-                push @result, $class->new( \%obj );
+                push @result, \%obj;
             }
             return scalar(@result) <= 1 ? $result[0] : \@result;
         };
@@ -316,6 +379,12 @@ sub _is_pk {
     return 0;
 }
 
+sub _is_full_pk {
+    my ( $class, $hash ) = @_;
+    my $pks = $class->indexes->{'PRIMARY'};
+    all { defined $hash->{$_} } @$pks;
+}
+
 #=========================== raw ==============================
 sub _get_dbh_key {
     my ( $class, $db ) = @_;
@@ -378,7 +447,7 @@ sub _notes {
     }
 }
 
-sub execute {
+sub execute_sth {
     my ( $class, $m_or_s, $stmt, $bind ) = @_;
     if (   $m_or_s eq SLAVE
         && $stmt =~ /^ *(INSERT|UPDATE|DELETE|REPLACE|ALTER|TRUNCATE)/i )
@@ -391,9 +460,14 @@ sub execute {
     $sth;
 }
 
+sub execute {
+    my ( $class, $m_or_s, $stmt, $bind ) = @_;
+    $class->execute_sth( $m_or_s, $stmt, $bind )->rows;
+}
+
 sub select_all {
     my ( $class, $m_or_s, $stmt, $bind, $filter ) = @_;
-    my $sth = $class->execute( $m_or_s, $stmt, $bind );
+    my $sth = $class->execute_sth( $m_or_s, $stmt, $bind );
     my $result = $sth->fetchall_arrayref( {} );
     if ( $filter && ref $filter eq 'CODE' ) {
         $_ = $filter->($_) foreach @$result;
@@ -403,7 +477,7 @@ sub select_all {
 
 sub select_row {
     my ( $class, $m_or_s, $stmt, $bind, $filter ) = @_;
-    my $sth = $class->execute( $m_or_s, $stmt, $bind );
+    my $sth = $class->execute_sth( $m_or_s, $stmt, $bind );
     my $result = $sth->fetchrow_hashref;
     if ( $filter && ref $filter eq 'CODE' && $result ) {
         $result = $filter->($result);
@@ -413,7 +487,7 @@ sub select_row {
 
 sub select_one {
     my ( $class, $m_or_s, $stmt, $bind ) = @_;
-    my $sth = $class->execute( $m_or_s, $stmt, $bind );
+    my $sth = $class->execute_sth( $m_or_s, $stmt, $bind );
     my @row = $sth->fetchrow_array;
     return $row[0];
 }
@@ -427,92 +501,93 @@ sub _get_last_insert_id {
 
 sub search {
     my ( $class, $where, $order, $count, $offset ) = @_;
-    my $sql = SQL::Abstract->new;
     my ( $stmt, @bind ) =
       $sql->select( $class->table_name, "*", $where, $order );
     $stmt .= " LIMIT $count"   if $count;
     $stmt .= " OFFSET $offset" if $offset;
 
-    my $result = $class->select_all(
-        SLAVE, $stmt,
-        \@bind,
-        sub {
-            my $row = shift;
-            $row->{__from_db} = 1;
-            $class->new($row);
-        }
-    );
+    my $result = $class->select_all( SLAVE, $stmt, \@bind, );
     return $result;
 }
 
-#======================== Instance Method ==========================
-sub is_from_db {
-    my $self = shift;
-    return $self->__from_db;
+sub count {
+    my ( $class, $where ) = @_;
+    my ( $stmt, @bind ) =
+      $sql->select( $class->table_name, "count(*)", $where );
+    my $result = $class->select_one( SLAVE, $stmt, \@bind );
+    return $result;
 }
 
 sub update {
-    my ($self) = @_;
-    die "Cannot use this method" if !$self->is_from_db;
-    my $res = $self->_execute_single_wrapper(
-        'w',
-        sub {
-            shift->execute_single( 0, '=',
-                [ map { $self->$_ } @{ $self->indexes->{PRIMARY} } ],
-                1, 0, 'U', [ map { $self->$_ } @{ $self->columns } ] );
-        }
-    );
-    return $res->[1];
+    my ( $class, $value, $where ) = @_;
+    my ( $stmt, @bind ) = $sql->update( $class->table_name, $value, $where );
+    return $class->execute( MASTER, $stmt, \@bind );
+}
+
+sub delete {
+    my ( $class, $where ) = @_;
+    my ( $stmt, @bind ) = $sql->delete( $class->table_name, $where );
+    return $class->execute( MASTER, $stmt, \@bind );
 }
 
 sub create {
-    my ($self) = @_;
-    my $res = $self->_execute_single_wrapper(
+    my ( $class, $val ) = @_;
+    my ( $stmt, @bind ) = $sql->insert( $class->table_name, $val );
+    my $rows = $class->execute( MASTER, $stmt, \@bind );
+    return ( $rows && $class->auto_increment )
+      ? $class->_get_last_insert_id
+      : undef;
+}
+
+sub replace {
+    my ( $class, $val ) = @_;
+    my ( $stmt, @bind ) = $sql->insert( $class->table_name, $val );
+    $stmt =~ s/INSERT/REPLACE/i;
+    my $rows = $class->execute( MASTER, $stmt, \@bind );
+    return ( $rows && $class->auto_increment )
+      ? $class->_get_last_insert_id
+      : undef;
+}
+
+sub fast_create {
+    my ( $class, $val ) = @_;
+    my $res = $class->_execute_single_wrapper(
         'w',
         sub {
-            shift->execute_single( 0, '+',
-                [ map { $self->$_ } @{ $self->columns } ],
+            shift->execute_single( $class->_pk_index_num, '+',
+                [ map { $val->{$_} } @{ $class->columns } ],
                 1, 0 );
         }
     );
 }
 
-sub delete {
-    my ($self) = @_;
-    my $res = $self->_execute_single_wrapper(
-        'w',
-        sub {
-            shift->execute_single( 0, '=',
-                [ map { $self->$_ } @{ $self->indexes->{PRIMARY} } ],
-                1, 0, 'D' );
+sub fast_create_ignore {
+    my ( $class, $val ) = @_;
+    eval { $class->fast_create($val); };
+    if ($@) {
+        unless ( ref $@ eq 'Mixi::HS::Exception' && $@->error eq '121' ) {
+            $@->throw;
         }
-    );
-    return $res->[1];
+    }
 }
 
-sub create_auto_inc {
-    my ($self) = @_;
-    die "no auto_increment" unless $self->auto_increment;
-    my $sql       = SQL::Abstract->new;
-    my $fieldvals = $self->to_hash;
-    my ( $stmt, @bind ) = $sql->insert( $self->table_name, $fieldvals );
-    $self->execute( MASTER, $stmt, \@bind );
-    return $self->_get_last_insert_id;
-}
+sub fast_create_or_update {
+    my ( $class, $val ) = @_;
+    die "Must contains primary key values"
+      if any { !defined $val->{$_} } @{ $class->indexes->{'PRIMARY'} };
 
-sub to_hash {
-    my ($self) = @_;
-    my %fieldvals;
-    map { $fieldvals{$_} = $self->$_ } @{ $self->columns };
-    return \%fieldvals;
-}
-
-sub inspect {
-    my ($self) = @_;
-    "["
-      . join( ", ",
-        map { $_ . " => '" . ( $self->$_ || "" ) . "'" } @{ $self->columns } )
-      . "]";
+    eval { $class->fast_create($val); };
+    if ($@) {
+        unless ( ref $@ eq 'Mixi::HS::Exception' && $@->error eq '121' ) {
+            die $@;
+        }
+        else {
+            my $func_name =
+              "update_by_" . join( "_", @{ $class->indexes->{'PRIMARY'} } );
+            $class->$func_name( $val,
+                [ map { $val->{$_} } @{ $class->indexes->{'PRIMARY'} } ] );
+        }
+    }
 }
 
 1;

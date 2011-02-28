@@ -22,7 +22,7 @@ DEFAULT :
         - "localhost:3307"
         - "localhost:3307"
     user : "root"
-    password : "cjnyhwm1" 
+    password : "" 
     hs_port : 9998
     hs_port_w : 9999
 

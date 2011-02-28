@@ -60,49 +60,60 @@ init_file应该在一个进程的生命周期内只被调用一次。例如在ps
 
 4. 操作
 ======================================================
+
 **** shard切换 ****
 my $shard_count = $foo->shard_count; #一共有几个shard
 $foo->switch_shard(0)  #切换到第一个shard，下标是从0开始的
 
-**** 通过HandlerSocket查询 ****
-#会根据表具体的索引自动生成方法(通过HandlerSocket)
-#比如一个表有4个列（id, name, age, created_at）
-#主建是id, 另外有一个索引是(name, age)
-
-#找到id是1的行, 如果找到对应的行，那么返回MyApp::Test::Foo的一个instance，如果没找到，那么返回undef
-$foo->find_by_pk([1]); 
-
-#其他索引的方法名规则是被索引的列通过"_"连接，如果没有符合条件的行，那么返回undef，如果只有一条，那么返回MyApp::Test::Foo的一个instance，如果有多行，那么返回由多个instance组成的array_ref
-$foo->find_by_name_age(["abc", 10], 1, 0);
-#第一个参数是与索引列相应的值，后续的参数（这里是10）是可选的。第2个参数是count，第3个是offset
 
 **** 通过HandlerSocket进行CRUD ****
-MyApp::Test::Foo的instance为表中每一列都自动生成了方法，比如
-my $a = $foo->find_by_pk([1]);
-my $name = $a->name;   #获取name
-$a->name("changed");   #修改name, 但是主键是不可以修改的
-my $b = $foo->new({ id => 222, name => "ren", age => 25, created_at => "2222-2-22 22:22:22" });  #也可以自己new出来
+==== Create ====
+$foo->fast_create(hashref); 该方法无法获得auto_increment的主键
+$foo->fast_create_ignore(hashref); 如果发生主键冲突或者唯一键冲突，则不插入
+$foo->fash_create_or_update(hashref); 如果发生主键冲突或者唯一键冲突，则进行更新
 
-$b->create  #创建一条记录（通过HandlerSocket），因为HandlerSocket直接与Engine对话，因此没有错误检查，比如你给int的字段传了个a，程序不会报错，Engine默认把a当0来处理。!!这种方法没办法获取auto_increment生成的主键
-$b->create_auto_inc #如果要获得auto_increment的主键，那么只能走这个SQL的方法。
+==== Read ====
+会根据表具体的索引自动生成方法(通过HandlerSocket)
+比如一个表有4个列（id, name, age, created_at）
+主建是id, 另外有一个索引是(name, age)
+则会自动生成find_by_id, find_by_name_age
 
-$a->update   #上面我把name修改了，更新到数据库中
-$a->delete   #在数据库中删除这条记录
+#找到id是1的行, 如果找到对应的行，那么返回一个Hashref，key值对应表中的每一列，如果没找到，那么返回undef
+$foo->find_by_id([1]); 
 
-$a->to_hash  #转化成native的hash
-$a->inspect  #输出可读的instance内部信息，不要用Dumper了 :)
+#其他索引的方法名规则是被索引的列通过"_"连接，如果没有符合条件的行，那么返回undef，如果只有一条，那么返回一个Hashref，如果有多行，那么返回由多个Hashref组成的array_ref
+$foo->find_by_name_age(["abc", 10], 1, 0);
+#第一个参数是与索引列相应的值，后续的参数（这里是10）是可选的。第2个参数是count，第3个是offset
+#find_by_xxx系列方法还支持第4个参数op,其默认值是"=",但也支持"<","<=",">",">="。
+
+==== Update ====
+生成策略同find_by_xxx，为update_by_xxxx
+update_by_id, update_by_name_age
+参数为($value [HashRef], $where [ArrayRef, 按顺序一次对应name, age], $count [Int，默认1], $offset[Int默认1], $op[=,<,<=,>,>=])
+返回结果为修改的行数
+
+==== Delete ====
+delete_by_xxxx,
+delete_by_id, delete_by_name_age
+参数为($where , $count, $offset, $op), 与update_by_xx类似
+返回结果为删除的行数
+
 
 **** SQL方法 ****
 HandlerSocket速度很快，但是有些时候我们还是得借助SQL的力量
 
-$foo->search($where, $order, $count, $offset) #参考SQL::Abstract的参数，返回是一个array_ref，其中包含0～N个$foo的instance
+$foo->search($where, $order, $count, $offset) #参考SQL::Abstract的参数，返回是一个array_ref，其中包含0～N个hashref
 
-#其他方法根据需要再添加
+$foo->update($value, $where) #返回修改的行数
+$foo->delete($where)  #返回删除的行数
+$foo->create($value)  #返回：如果表有自增主键，那么返回自增的这个值，如果没有则返回undef
+$foo->replace($value) #返回同create
+
 
 **** 更RAW的方法 ****  
 !!!以下方法除非在不得不的情况下，请不要使用
 
-$foo->execute("master"|"slave", $stmt, $bind)
+$foo->execute("master"|"slave", $stmt, $bind)  #返回影响的行数
 $foo->select_all("master"|"slave", $stmt, $bind, $filter)
 $foo->select_row("master"|"slave", $stmt, $bind, $filter)
 $foo->select_one("master"|"slave", $stmt, $bind)

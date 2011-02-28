@@ -62,7 +62,7 @@ sub load {
     my ($name) = @_;
 
     my $c = $models{ $g_namespace . "::" . $name };
-    die if !defined $c;
+    die "Cannot find ${g_namespace}::$name" if !defined $c;
 
     return $c;
 }
